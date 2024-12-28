@@ -1,91 +1,91 @@
+// MultiDetectionService.js
+
 import { merge, combineLatest } from 'rxjs';
 import { filter, map, bufferTime } from 'rxjs/operators';
 import { channelNames } from 'muse-js';
+import { sendEventToUnity } from './websocketService'; 
+// ↑ This should export initWebSocket() and sendEventToUnity(eventType).
 
 export class MultiDetectionService {
   constructor(eegObservable, onEyeBlink, onJawClench) {
     this.eegObservable = eegObservable;
-    this.onEyeBlink = onEyeBlink;
-    this.onJawClench = onJawClench;
+    this.onEyeBlink = onEyeBlink;    // Callback in React (optional)
+    this.onJawClench = onJawClench;  // Callback in React (optional)
 
-    // Thresholds (adjust based on your actual amplitude logs)
+    // Thresholds for detection (tweak as needed)
     this.eyeThreshold = 300;
-    this.jawThreshold = 300;
+    this.jawThreshold = 500;
 
-    // How long to ignore after one detection, in ms
+    // How frequently we buffer EEG amplitude (ms)
+    this.bufferDuration = 300;
+
+    // After triggering, ignore further detections for this long (ms)
     this.cooldownDuration = 1000;
     this.cooldownActive = false;
 
-    // Channels (confirm these indices match your Muse device)
+    // Indices for channels (check channelNames matches your device)
     this.leftEyeChannel = channelNames.indexOf('AF7');
     this.rightEyeChannel = channelNames.indexOf('AF8');
     this.leftJawChannel = channelNames.indexOf('TP9');
     this.rightJawChannel = channelNames.indexOf('TP10');
-
-    // Buffer each channel’s data for 300 ms so we can look for a single max in that window
-    this.bufferMs = 300;
   }
 
   start() {
-    console.log('Starting unified detection with winner-takes-all approach.');
+    console.log('Starting unified detection (winner-takes-all approach).');
 
-    // 1. Eye channels => single stream that emits the max amplitude of AF7/AF8 every 300 ms
+    // ===== EYE STREAM =====
     const eyeLeft$ = this.eegObservable.pipe(
-      filter((r) => r.electrode === this.leftEyeChannel),
-      map((r) => Math.max(...r.samples.map(Math.abs)))
+      filter((reading) => reading.electrode === this.leftEyeChannel),
+      map((reading) => Math.max(...reading.samples.map(Math.abs)))
     );
     const eyeRight$ = this.eegObservable.pipe(
-      filter((r) => r.electrode === this.rightEyeChannel),
-      map((r) => Math.max(...r.samples.map(Math.abs)))
+      filter((reading) => reading.electrode === this.rightEyeChannel),
+      map((reading) => Math.max(...reading.samples.map(Math.abs)))
     );
 
-    // Merge the two eye channels, then buffer the merged stream
+    // Merge left + right eye channels, buffer, extract max amplitude in that window
     const eye$ = merge(eyeLeft$, eyeRight$).pipe(
-      bufferTime(this.bufferMs),
-      map((values) => (values.length ? Math.max(...values) : 0))
+      bufferTime(this.bufferDuration),
+      map((samples) => (samples.length ? Math.max(...samples) : 0))
     );
 
-    // 2. Jaw channels => single stream for TP9/TP10
+    // ===== JAW STREAM =====
     const jawLeft$ = this.eegObservable.pipe(
-      filter((r) => r.electrode === this.leftJawChannel),
-      map((r) => Math.max(...r.samples.map(Math.abs)))
+      filter((reading) => reading.electrode === this.leftJawChannel),
+      map((reading) => Math.max(...reading.samples.map(Math.abs)))
     );
     const jawRight$ = this.eegObservable.pipe(
-      filter((r) => r.electrode === this.rightJawChannel),
-      map((r) => Math.max(...r.samples.map(Math.abs)))
+      filter((reading) => reading.electrode === this.rightJawChannel),
+      map((reading) => Math.max(...reading.samples.map(Math.abs)))
     );
 
-    // Merge the two jaw channels, then buffer
+    // Merge left + right jaw channels, buffer, extract max amplitude
     const jaw$ = merge(jawLeft$, jawRight$).pipe(
-      bufferTime(this.bufferMs),
-      map((values) => (values.length ? Math.max(...values) : 0))
+      bufferTime(this.bufferDuration),
+      map((samples) => (samples.length ? Math.max(...samples) : 0))
     );
 
-    // 3. Compare eye vs. jaw each time they emit
-    //    combineLatest => we get [eyeAmplitude, jawAmplitude]
+    // ===== COMBINE EYE AND JAW =====
     combineLatest([eye$, jaw$]).subscribe(([eyeAmp, jawAmp]) => {
-      // If we’re in cooldown, skip
+      // If in cooldown, skip detection
       if (this.cooldownActive) return;
 
-      // Debug logs
       console.log(`[BLINK DEBUG] Eye amplitude: ${eyeAmp}`);
-      console.log(`[JAW DEBUG] Jaw amplitude:  ${jawAmp}`);
+      console.log(`[JAW DEBUG]   Jaw amplitude: ${jawAmp}`);
 
-      // If neither passes its threshold, do nothing
       const eyePassed = eyeAmp > this.eyeThreshold;
       const jawPassed = jawAmp > this.jawThreshold;
 
-      if (!eyePassed && !jawPassed) {
-        return;
-      }
+      // If neither passes threshold, do nothing
+      if (!eyePassed && !jawPassed) return;
 
-      // If one passes but not the other, pick that. If both pass, pick whichever is higher
+      // If only one passes, pick that. If both pass, pick whichever amplitude is higher.
       if (eyePassed && !jawPassed) {
         this.triggerEye();
-      } else if (jawPassed && !eyePassed) {
+      } else if (!eyePassed && jawPassed) {
         this.triggerJaw();
       } else {
-        // Both passed => pick "winner" by amplitude
+        // Both pass => "winner-takes-all"
         if (eyeAmp > jawAmp) {
           this.triggerEye();
         } else {
@@ -95,18 +95,23 @@ export class MultiDetectionService {
     });
   }
 
+  // ===== TRIGGER EYE DETECTION =====
   triggerEye() {
     console.log('Eyes blinked!');
-    this.onEyeBlink?.();
+    this.onEyeBlink?.();            // Optional callback in React
+    sendEventToUnity('BLINK');      // Send to Node.js => Unity
     this.startCooldown();
   }
 
+  // ===== TRIGGER JAW DETECTION =====
   triggerJaw() {
     console.log('Jaw clenched!');
     this.onJawClench?.();
+    sendEventToUnity('JAW');
     this.startCooldown();
   }
 
+  // ===== PREVENT SPAMMING =====
   startCooldown() {
     this.cooldownActive = true;
     setTimeout(() => {
